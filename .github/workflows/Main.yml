@@ -1,5 +1,5 @@
 
-name: RDP - Windows Tailscale Android
+name: RDP - Windows Tailscale Android PRO
 
 on:
   workflow_dispatch:
@@ -8,43 +8,74 @@ permissions:
   contents: read
 
 concurrency:
-  group: rdp-windows-session
-  cancel-in-progress: true
+  group: windows-rdp
+  cancel-in-progress: false
 
 jobs:
   secure-rdp:
-    name: Windows Remote Desktop
-    runs-on: windows-latest
-    timeout-minutes: 350
+    name: Configure Windows Remote Desktop
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
 
     steps:
-      - name: Install Tailscale
+      - name: Check Windows and permissions
         shell: powershell
-        timeout-minutes: 5
         run: |
           $ErrorActionPreference = "Stop"
 
-          $installer = "$env:TEMP\tailscale-setup.exe"
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          Start-Process $installer -ArgumentList "/quiet" -Wait
+          if (!$principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator
+          )) {
+            throw "Runner must run with administrator privileges"
+          }
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "Windows: $($os.Caption)"
+
+          if ($os.Caption -match "Home") {
+            throw "Windows Home cannot host Microsoft RDP"
+          }
+
+      - name: Verify Tailscale
+        id: tailscale
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = "Stop"
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (!(Test-Path $ts)) {
-            throw "Tailscale installation failed"
+            throw "Install Tailscale on this Windows computer first"
           }
 
           $service = Get-Service Tailscale
+
           if ($service.Status -ne "Running") {
             Start-Service Tailscale
           }
 
-          Write-Host "Tailscale installed"
+          $ip = & $ts ip -4
 
-      - name: Create automatic RDP credentials
-        id: creds
+          if ($LASTEXITCODE -ne 0 -or !$ip) {
+            throw "Tailscale is not connected"
+          }
+
+          $ip = ($ip | Select-Object -First 1).Trim()
+
+          if ($ip -notmatch '^100\.') {
+            throw "Invalid Tailscale IPv4 address"
+          }
+
+          "ip=$ip" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Tailscale connection verified"
+
+      - name: Generate Windows account
+        id: credentials
         shell: powershell
         timeout-minutes: 2
         run: |
@@ -53,7 +84,7 @@ jobs:
           $username = "RemoteUser"
 
           $bytes = New-Object byte[] 32
-          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
           $rng.GetBytes($bytes)
           $rng.Dispose()
 
@@ -71,11 +102,14 @@ jobs:
             -ErrorAction SilentlyContinue
 
           if ($existing) {
-            Set-LocalUser -Name $username -Password $secure
+            Set-LocalUser -Name $username `
+              -Password $secure `
+              -PasswordNeverExpires $true
           } else {
             New-LocalUser -Name $username `
               -Password $secure `
-              -Description "Tailscale Remote Desktop"
+              -PasswordNeverExpires `
+              -Description "Private Tailscale RDP account"
           }
 
           Add-LocalGroupMember `
@@ -87,33 +121,34 @@ jobs:
           "password=$password" >> $env:GITHUB_OUTPUT
 
           Write-Host "::add-mask::$password"
-          Write-Host "RDP account created successfully"
+          Write-Host "Windows credentials generated"
 
-      - name: Configure secure Remote Desktop
+      - name: Configure secure RDP
         shell: powershell
-        timeout-minutes: 3
+        timeout-minutes: 2
         run: |
           $ErrorActionPreference = "Stop"
 
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
+          $path = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
 
-          # Keep Network Level Authentication enabled.
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" -Value 1
+          Set-ItemProperty -Path $path `
+            -Name fDenyTSConnections -Value 0
+
+          $rdpPath = "$path\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $rdpPath `
+            -Name UserAuthentication -Value 1
 
           Set-Service TermService -StartupType Automatic
           Start-Service TermService
 
           Get-NetFirewallRule `
-            -DisplayName "RDP over Tailscale only" `
+            -DisplayName "RDP Tailscale Private" `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
 
           New-NetFirewallRule `
-            -DisplayName "RDP over Tailscale only" `
+            -DisplayName "RDP Tailscale Private" `
             -Direction Inbound `
             -Protocol TCP `
             -LocalPort 3389 `
@@ -123,53 +158,7 @@ jobs:
 
           Write-Host "Secure RDP configured"
 
-      - name: Connect Tailscale
-        id: ts
-        shell: powershell
-        timeout-minutes: 5
-        env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Missing TS_AUTHKEY secret"
-          }
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $ts up `
-            "--authkey=$env:TS_AUTHKEY" `
-            "--hostname=android-rdp-${{ github.run_id }}"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed"
-          }
-
-          $ip = $null
-
-          for ($i = 0; $i -lt 20; $i++) {
-            Start-Sleep -Seconds 3
-            $result = & $ts ip -4 2>$null
-
-            if ($LASTEXITCODE -eq 0 -and $result) {
-              $candidate = ($result | Select-Object -First 1).Trim()
-
-              if ($candidate -match '^100\.') {
-                $ip = $candidate
-                break
-              }
-            }
-          }
-
-          if (!$ip) {
-            throw "Tailscale IP unavailable"
-          }
-
-          "ip=$ip" >> $env:GITHUB_OUTPUT
-          Write-Host "Tailscale connected"
-
-      - name: Verify RDP service
+      - name: Verify RDP listener
         shell: powershell
         timeout-minutes: 2
         run: |
@@ -177,7 +166,7 @@ jobs:
 
           $ready = $false
 
-          for ($i = 0; $i -lt 24; $i++) {
+          for ($i = 0; $i -lt 20; $i++) {
             $listener = Get-NetTCPConnection `
               -LocalPort 3389 `
               -State Listen `
@@ -188,73 +177,41 @@ jobs:
               break
             }
 
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds 3
           }
 
           if (!$ready) {
             throw "RDP port 3389 is not listening"
           }
 
-          Write-Host "RDP listener is active"
+          Write-Host "RDP listener is ready"
 
-      - name: Publish Android connection details
+      - name: Publish connection details
         shell: powershell
         env:
-          RDP_IP: ${{ steps.ts.outputs.ip }}
-          RDP_USER: ${{ steps.creds.outputs.username }}
-          RDP_PASS: ${{ steps.creds.outputs.password }}
+          RDP_IP: ${{ steps.tailscale.outputs.ip }}
+          RDP_USER: ${{ steps.credentials.outputs.username }}
+          RDP_PASS: ${{ steps.credentials.outputs.password }}
         run: |
           $summary = @"
-          # WINDOWS RDP - CONNECTION DETAILS
+          # WINDOWS RDP - CONNECTION INFORMATION
 
-          **Status:** ONLINE
+          Status: READY
 
-          **Tailscale IP:** $env:RDP_IP
+          Tailscale IP: $env:RDP_IP
 
-          **Username:** $env:RDP_USER
+          Username: $env:RDP_USER
 
-          **Password:** $env:RDP_PASS
+          Password: $env:RDP_PASS
 
-          **Port:** 3389
+          RDP Port: 3389
 
-          **Protocol:** RDP + Tailscale
+          Protocol: RDP + Tailscale
 
-          **Session ID:** $env:GITHUB_RUN_ID
-
-          Connect using the private Tailscale network.
           "@
 
           $summary | Out-File `
             -FilePath $env:GITHUB_STEP_SUMMARY `
             -Append -Encoding utf8
 
-          Write-Host "Connection details published"
-
-      - name: Maintain RDP session
-        shell: powershell
-        timeout-minutes: 340
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          Write-Host "RDP SESSION ACTIVE"
-
-          while ($true) {
-            $service = Get-Service TermService
-            $listener = Get-NetTCPConnection `
-              -LocalPort 3389 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-            $ip = & $ts ip -4 2>$null
-
-            if ($service.Status -ne "Running" -or !$listener -or !$ip) {
-              Write-Warning "Connection health check failed"
-              throw "RDP or Tailscale connection lost"
-            }
-
-            Write-Host "[$(Get-Date)] RDP ONLINE - $ip"
-
-            Start-Sleep -Seconds 60
-          }
+          Write-Host "Connection information published"
