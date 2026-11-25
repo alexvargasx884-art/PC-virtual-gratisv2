@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rdp-windows-session
+  group: windows-rdp-session
   cancel-in-progress: false
 
 jobs:
@@ -20,15 +20,13 @@ jobs:
 
       # 1. Prepare Windows
       - name: Prepare Windows
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 3
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Preparing Windows runner..."
-
           $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 
           if (!$principal.IsInRole(
             [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -38,52 +36,48 @@ jobs:
 
           Write-Host "Windows runner ready"
 
-      # 2. Install Tailscale with retries
+      # 2. Install Tailscale
       - name: Install Tailscale
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 8
         run: |
           $ErrorActionPreference = "Stop"
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $installer = "$env:TEMP\tailscale-installer.msi"
+          $installer = "$env:TEMP\tailscale-setup.msi"
 
           if (!(Test-Path $ts)) {
 
             $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
 
-            $downloaded = $false
+            $success = $false
 
             for ($i = 1; $i -le 4; $i++) {
               try {
-                Write-Host "Download attempt $i of 4"
+                Write-Host "Downloading Tailscale: attempt $i"
 
                 Invoke-WebRequest `
                   -Uri $url `
                   -OutFile $installer `
-                  -TimeoutSec 120 `
-                  -UseBasicParsing
+                  -TimeoutSec 120
 
                 if (!(Test-Path $installer) -or
                     (Get-Item $installer).Length -lt 1000000) {
                   throw "Invalid installer"
                 }
 
-                $downloaded = $true
+                $success = $true
                 break
               }
               catch {
                 Write-Warning $_.Exception.Message
-
-                Remove-Item $installer -Force `
-                  -ErrorAction SilentlyContinue
-
+                Remove-Item $installer -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 8
               }
             }
 
-            if (!$downloaded) {
-              throw "Unable to download Tailscale"
+            if (!$success) {
+              throw "Tailscale download failed"
             }
 
             $process = Start-Process `
@@ -92,101 +86,86 @@ jobs:
               -Wait -PassThru
 
             if ($process.ExitCode -notin @(0,3010)) {
-              throw "Tailscale installation failed: $($process.ExitCode)"
+              throw "Tailscale installation error: $($process.ExitCode)"
             }
           }
 
           if (!(Test-Path $ts)) {
-            throw "Tailscale executable missing"
+            throw "Tailscale executable not found"
           }
 
-          $service = Get-Service Tailscale `
-            -ErrorAction SilentlyContinue
-
-          if (!$service) {
-            throw "Tailscale service not found"
-          }
+          $service = Get-Service Tailscale -ErrorAction Stop
 
           if ($service.Status -ne "Running") {
             Start-Service Tailscale
           }
 
-          Start-Sleep -Seconds 5
-
           Write-Host "Tailscale installed successfully"
 
-      # 3. Generate Windows credentials
-      - name: Generate Windows credentials
+      # 3. Generate RANDOM credentials
+      - name: Generate random Windows credentials
         id: credentials
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 2
         run: |
           $ErrorActionPreference = "Stop"
 
-          $username = "RemoteUser"
+          function New-RandomHex($length) {
+            $bytes = New-Object byte[] $length
+            $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+            $rng.GetBytes($bytes)
+            $rng.Dispose()
 
-          $bytes = New-Object byte[] 32
-
-          $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-          $rng.GetBytes($bytes)
-          $rng.Dispose()
-
-          $random = [Convert]::ToBase64String($bytes).
-            TrimEnd('=').
-            Replace('+','A').
-            Replace('/','B')
-
-          $password = "Aa1!" + $random
-
-          $secure = ConvertTo-SecureString `
-            $password -AsPlainText -Force
-
-          $existing = Get-LocalUser -Name $username `
-            -ErrorAction SilentlyContinue
-
-          if ($existing) {
-
-            Set-LocalUser `
-              -Name $username `
-              -Password $secure `
-              -PasswordNeverExpires $true
-
-          } else {
-
-            New-LocalUser `
-              -Name $username `
-              -Password $secure `
-              -PasswordNeverExpires `
-              -Description "Private Tailscale RDP account"
+            return ([BitConverter]::ToString($bytes) -replace '-', '')
           }
 
+          $username = "USER_" + (New-RandomHex 6)
+
+          # Strong random password
+          $password = "Aa1!" + (New-RandomHex 24)
+
+          $securePassword = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -PasswordNeverExpires `
+            -AccountNeverExpires `
+            -Description "Temporary Tailscale RDP account"
+
+          # Add user to Remote Desktop Users using its Windows SID
+          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
+
           Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $username `
-            -ErrorAction SilentlyContinue
+            -Group $rdpGroup `
+            -Member $username
+
+          if (!(Get-LocalUser -Name $username)) {
+            throw "Windows account creation failed"
+          }
 
           "RDP_USERNAME=$username" >> $env:GITHUB_ENV
           "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
           Write-Host "::add-mask::$password"
 
-          Write-Host "Windows credentials created"
+          Write-Host "Random Windows credentials generated"
 
-      # 4. Configure secure RDP
+      # 4. Configure RDP securely
       - name: Configure Remote Desktop
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 3
         run: |
           $ErrorActionPreference = "Stop"
 
           $base = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $rdp = "$base\WinStations\RDP-Tcp"
 
           Set-ItemProperty `
             -Path $base `
             -Name "fDenyTSConnections" `
             -Value 0
-
-          $rdp = "$base\WinStations\RDP-Tcp"
 
           Set-ItemProperty `
             -Path $rdp `
@@ -210,12 +189,12 @@ jobs:
             -Action Allow `
             -Profile Any
 
-          Write-Host "Remote Desktop configured"
+          Write-Host "RDP configured"
 
       # 5. Connect Tailscale
       - name: Connect Tailscale
         id: tailscale
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 5
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
@@ -233,19 +212,17 @@ jobs:
             "--hostname=android-rdp-${{ github.run_id }}"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale authentication failed"
+            throw "Tailscale connection failed"
           }
 
           $ip = $null
 
           for ($i = 0; $i -lt 30; $i++) {
-
             Start-Sleep -Seconds 3
 
             $result = & $ts ip -4 2>$null
 
             if ($LASTEXITCODE -eq 0 -and $result) {
-
               $candidate = ($result | Select-Object -First 1).Trim()
 
               if ($candidate -match '^100\.') {
@@ -256,16 +233,16 @@ jobs:
           }
 
           if (!$ip) {
-            throw "Tailscale IP was not assigned"
+            throw "Tailscale IP not assigned"
           }
 
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
 
           Write-Host "Tailscale connected successfully"
 
-      # 6. Verify RDP
+      # 6. Verify RDP listener
       - name: Verify RDP
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 3
         run: |
           $ErrorActionPreference = "Stop"
@@ -273,7 +250,6 @@ jobs:
           $ready = $false
 
           for ($i = 0; $i -lt 30; $i++) {
-
             $listener = Get-NetTCPConnection `
               -LocalPort 3389 `
               -State Listen `
@@ -293,28 +269,46 @@ jobs:
 
           Write-Host "RDP listener verified"
 
-      # 7. Publish connection information
+      # 7. Publish IP + USER + PASSWORD
       - name: Publish Android connection details
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
+          if (!$env:TAILSCALE_IP -or
+              !$env:RDP_USERNAME -or
+              !$env:RDP_PASSWORD) {
+            throw "Connection information is incomplete"
+          }
+
           $summary = @"
-          # WINDOWS RDP CONNECTION
+          # WINDOWS RDP - ANDROID CONNECTION
 
-          Status: READY
+          ## STATUS: READY
 
-          Address: $env:TAILSCALE_IP
+          **IP ADDRESS**
 
-          Username: $env:RDP_USERNAME
+          $env:TAILSCALE_IP
 
-          Password: $env:RDP_PASSWORD
+          **USERNAME**
 
-          Port: 3389
+          $env:RDP_USERNAME
 
-          Protocol: Tailscale + RDP
+          **PASSWORD**
 
-          Session: $env:GITHUB_RUN_ID
+          $env:RDP_PASSWORD
+
+          **PORT**
+
+          3389
+
+          **PROTOCOL**
+
+          Tailscale + Windows Remote Desktop
+
+          **RUN ID**
+
+          $env:GITHUB_RUN_ID
 
           "@
 
@@ -326,44 +320,42 @@ jobs:
 
       # 8. Maintain session
       - name: Maintain RDP session
-        shell: powershell
+        shell: pwsh
         timeout-minutes: 330
         run: |
           $ErrorActionPreference = "Stop"
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           Write-Host "RDP SESSION ACTIVE"
 
           while ($true) {
 
-            $service = Get-Service TermService
             $tsService = Get-Service Tailscale
+            $rdpService = Get-Service TermService
 
             if ($tsService.Status -ne "Running") {
-              Write-Warning "Restarting Tailscale service"
+              Write-Warning "Restarting Tailscale"
               Start-Service Tailscale
             }
 
-            if ($service.Status -ne "Running") {
-              Write-Warning "Restarting RDP service"
+            if ($rdpService.Status -ne "Running") {
+              Write-Warning "Restarting Remote Desktop"
               Start-Service TermService
             }
-
-            Start-Sleep -Seconds 5
 
             $listener = Get-NetTCPConnection `
               -LocalPort 3389 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
             $ip = & $ts ip -4 2>$null
 
             if (!$listener -or !$ip) {
               Write-Warning "Connection health check failed"
-            } else {
+            }
+            else {
               Write-Host "[$(Get-Date)] RDP ONLINE - $ip"
             }
 
-            Start-Sleep -Seconds 55
+            Start-Sleep -Seconds 60
           }
