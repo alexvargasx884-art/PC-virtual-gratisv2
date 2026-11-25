@@ -1,0 +1,81 @@
+
+name: Windows Tailscale Remote
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          Invoke-WebRequest $url -OutFile "$env:TEMP\tailscale.exe"
+          Start-Process "$env:TEMP\tailscale.exe" `
+            -ArgumentList "/quiet" -Wait
+
+      - name: Configure Windows user
+        shell: powershell
+        env:
+          WIN_USER: ${{ secrets.WIN_USER }}
+          WIN_PASSWORD: ${{ secrets.WIN_PASSWORD }}
+        run: |
+          if (-not $env:WIN_USER -or -not $env:WIN_PASSWORD) {
+            throw "Missing Windows credentials"
+          }
+
+          $secure = ConvertTo-SecureString `
+            $env:WIN_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $env:WIN_USER `
+              -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $env:WIN_USER `
+              -Password $secure
+          }
+
+          Add-LocalGroupMember -Group "Administrators" `
+            -Member $env:WIN_USER `
+            -ErrorAction SilentlyContinue
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale installation not found"
+          }
+
+          & $tailscale up --authkey=$env:TS_AUTHKEY
+          Start-Sleep -Seconds 10
+          & $tailscale ip -4
+
+      - name: Configure Remote Desktop
+        shell: powershell
+        run: |
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Get-Service TermService |
+            Select-Object Name, Status
+
+          Write-Host "Remote Desktop configured"
+
+      - name: Show connection information
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "Tailscale IP:"
+          & $tailscale ip -4
+          Write-Host "RDP Port: 3389"
+          Write-Host "Windows user configured."
+          
